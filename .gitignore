@@ -32,6 +32,7 @@ data/eval/*
 data/eval/lm_eval/
 gguf*/
 *.gguf
+*.zip
 runs/
 wandb/
 

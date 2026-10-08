@@ -59,8 +59,10 @@ print(f"sum log p = {total.item():.3f}   mean log p = {mean.item():.3f}")
 # %%
 def my_dpo_loss(pc, pr, rc, rr, beta=0.1):
     """pc/pr: policy log-prob chosen/rejected; rc/rr: reference. Trả về loss trung bình."""
-    # TODO: viết bằng torch.nn.functional.logsigmoid
-    return None
+    chosen_reward = beta * (pc - rc)
+    rejected_reward = beta * (pr - rr)
+    loss = -torch.nn.functional.logsigmoid(chosen_reward - rejected_reward)
+    return loss.mean()
 
 
 # %%
@@ -122,6 +124,27 @@ for name, (pc_, pr_) in scenarios.items():
     print(f"{name:28s} RPO loss {M.rpo_loss(pc_, pr_, ref_c, ref_r, nll, beta=1.0).item():.3f}")
 
 # %% [markdown]
+# ### Trả lời câu hỏi về dịch chuyển xác suất (Likelihood Displacement)
+#
+# **Câu hỏi (README & Rubric):** Vì sao margin có thể tăng trong khi log-xác suất của câu `chosen` lại giảm?
+#
+# **Trả lời:**
+# 1. **Về mặt công thức:**
+#    Margin ngầm định của DPO được định nghĩa:
+#    $$\Delta = \left(\log \pi_\theta(y_w) - \log \pi_{ref}(y_w)\right) - \left(\log \pi_\theta(y_l) - \log \pi_{ref}(y_l)\right) = \frac{1}{\beta} \left(\hat{r}_\theta(y_w) - \hat{r}_\theta(y_l)\right)$$
+#    Hàm loss của DPO là:
+#    $$\mathcal{L}_{\text{DPO}} = -\mathbb{E}\left[\log \sigma(\beta \Delta)\right]$$
+#    Hàm loss chỉ phụ thuộc vào hiệu số (margin) $\Delta$, không ràng buộc độc lập giá trị tuyệt đối của từng thành phần $\log \pi_\theta(y_w)$ hay $\log \pi_\theta(y_l)$.
+#
+# 2. **Cơ chế dịch chuyển (Likelihood Displacement):**
+#    - Khi tối ưu loss, gradient cố gắng đẩy margin $\Delta$ tăng lên.
+#    - Nếu log-xác suất của câu `chosen` bị giảm ($\log \pi_\theta(y_w) < \log \pi_{ref}(y_w)$), nhưng log-xác suất của câu `rejected` lại bị giảm **mạnh hơn rất nhiều** ($\log \pi_\theta(y_l)$ giảm sâu hơn $\log \pi_\theta(y_w)$), thì hiệu số $\Delta$ vẫn là một số dương lớn.
+#    - Xem kịch bản B ở trên: $\log \pi$ của chosen giảm 3 nat, nhưng rejected giảm tới 5 nat $\rightarrow$ Margin vẫn đạt $+2$ nat, và loss giảm hoàn toàn giống kịch bản A (nơi chosen tăng 1 nat, rejected giảm 1 nat).
+#
+# 3. **Ý nghĩa thực tế:**
+#    Mô hình thường dễ tìm ra hướng gradient triệt tiêu các token xấu (rejected) trên toàn bộ phân phối hơn là nâng xác suất token tốt (chosen). Vì vậy, chỉ nhìn thấy margin tăng là chưa đủ để khẳng định mô hình tiến bộ; cần theo dõi riêng hai đường cong `rewards/chosen` và `rewards/rejected` (ở NB3) hoặc bổ sung thành phần NLL (như RPO) để neo xác suất của câu `chosen`.
+
+# %% [markdown]
 # ## 6. Bốn biến thể trên cùng một cặp
 #
 # | Loss | Cần mô hình tham chiếu (reference)? | Chuẩn hoá độ dài? | Ghi chú |
@@ -148,3 +171,14 @@ print(f"ORPO  {M.orpo_loss(avg_c, avg_r, -avg_c).item():.4f}")
 # **Câu hỏi cho REFLECTION §3:** tổng log-prob của câu dài luôn âm hơn câu ngắn.
 # Vì sao điều đó khiến DPO gốc dễ thiên vị độ dài, và SimPO/ORPO xử lý bằng cách nào?
 # Gợi ý: NB2 in ra tỉ lệ cặp có chosen dài hơn rejected trong dữ liệu tiếng Việt.
+#
+# ### Phân tích: Thiên vị độ dài & Cách xử lý của SimPO / ORPO
+#
+# **1. Vì sao DPO gốc thiên vị độ dài?**
+# - Log-prob của một câu là tổng log xác suất từng token: $\log \pi(y|x) = \sum_{t=1}^{|y|} \log \pi(y_t | x, y_{<t})$.
+# - Do mỗi xác suất $\pi(y_t) \le 1 \Rightarrow \log \pi(y_t) \le 0$, câu càng dài thì tổng log-prob càng âm.
+# - Trong DPO gốc, không có cơ chế chuẩn hóa độ dài $|y|$. Nếu dữ liệu preference có phần lớn câu `chosen` dài hơn `rejected` (như dữ liệu UltraFeedback tiếng Việt thường có tỉ lệ chosen dài hơn chiếm khoảng 60-70%), gradient phạt/thưởng sẽ bị thiên lệch theo số lượng token, khiến mô hình học "lối tắt" (shortcut) là viết dài ra để nhận reward ngầm cao hơn mà không thực sự cải thiện chất lượng nội dung.
+#
+# **2. Cách SimPO và ORPO giải quyết:**
+# - **SimPO:** Chuẩn hóa trực tiếp log-prob bằng độ dài câu (average log-prob: $\frac{1}{|y|} \log \pi(y|x)$) và sử dụng target margin cố định $\gamma$, loại bỏ hoàn toàn ảnh hưởng của độ dài chuỗi token.
+# - **ORPO:** Kết hợp hàm mất mát NLL của câu `chosen` với tỷ lệ odds ratio được chuẩn hóa độ dài, giúp cân bằng gradient giữa câu ngắn và câu dài mà không cần mô hình tham chiếu (reference model).
